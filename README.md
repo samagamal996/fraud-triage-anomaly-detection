@@ -17,12 +17,12 @@ file that imports Streamlit — it wires the other four together.
 
 | File | Owns | Branch |
 |---|---|---|
-| `data_layer.py` | Task 1 — schema validation, cleaning | `task1-data-layer` |
-| `features.py` | Task 2 — per-account behavioral features | `task2-features` |
-| `detectors.py` | Task 3 — rules + IsoForest + LOF | `task3-detectors` |
-| `explain.py` | Task 4 — alert justification text | `task4-explain` |
-| `app.py` | Task 5 — Streamlit app shell + feedback loop | `task5-app` |
-| `evaluate.py`, `tests/` | Task 6 — answer key, precision@k, fresh-data test | `task6-evaluation` |
+| `data_layer.py` | schema validation, cleaning | `task1-data-layer` |
+| `features.py` | per-account behavioral features | `task2-features` |
+| `detectors.py` | rules + IsoForest + LOF | `task3-detectors` |
+| `explain.py` | alert justification text | `task4-explain` |
+| `app.py` | Streamlit app shell + feedback loop | `task5-app` |
+| `evaluate.py`, `tests/` | answer key, precision@k, fresh-data test | `task6-evaluation` |
 
 ## Branch workflow
 
