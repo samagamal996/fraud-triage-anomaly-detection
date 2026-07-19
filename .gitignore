@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/
+data/feedback.jsonl
+*.xlsx
+!Sample_Data.xlsx
+.DS_Store
+.vscode/
+.idea/
