@@ -1,7 +1,5 @@
 # Fraud Triage — Anomaly Detection Project
 
-Ejada GRC Internship Program 2026 — Days 5-6 Build
-
 A ranked, explainable fraud alert triage app. Raw transactions CSV in →
 validated data → behavioral features → anomaly scores (rules + models) →
 ranked queue with plain-English explanations → analyst feedback loop.
