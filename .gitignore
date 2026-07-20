@@ -6,6 +6,7 @@ __pycache__/
 data/feedback.jsonl
 *.xlsx
 !Sample_Data.xlsx
+!Synthetic_Fraud_Test_Data.xlsx
 .DS_Store
 .vscode/
 .idea/
