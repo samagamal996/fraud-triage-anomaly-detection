@@ -1,12 +1,10 @@
 from data_layer import validate
+from features import build
 
 df = validate(r"data\Sample_Data.xlsx")
 df = validate(r"data\fraud-triage-anomaly-detection/data/Synthetic_Fraud_Test_Data.xlsx")
+features = build(df)
 
-print("=" * 50)
-print("Validation Passed!")
-print("=" * 50)
-
-print(df.shape)
-print(df.head())
-print(df.dtypes)
+print(features.shape)
+print(features.columns)
+print(features.head())

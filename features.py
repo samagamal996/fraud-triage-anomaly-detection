@@ -57,10 +57,17 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["IBAN", "timestamp"], kind="mergesort").copy()
     _validate_inputs(df)
     grouped = df.groupby("IBAN", sort=False, dropna=False)
+    # Separate grouping for anything that SUMS Transaction Amount. Without a
+    # real exchange rate, summing e.g. 5000 EGP + 100 USD as "5100" is
+    # meaningless -- confirmed on real data (14,697.21 was actually
+    # 64.26 EGP + 14,557.00 EGP + 75.95 USD added as if one currency).
+    # Counts (tx_count_24h, declined_burst_count) and time-based features
+    # (dormancy_days, hour_deviation) are currency-agnostic and unaffected.
+    grouped_currency = df.groupby(["IBAN", "Currency"], sort=False, dropna=False)
 
     # Group A — core baseline
     df["log_amount"] = _log_amount(df)
-    df["amount_ratio"] = _amount_ratio(df, grouped)
+    df["amount_ratio"] = _amount_ratio(df, grouped_currency)
     df["tx_count_24h"] = _tx_count_24h(df, grouped)
     df["sum_48h_window"] = _sum_48h_window(df, grouped)
     df["new_country_flag"], df["country_signal_strength"] = _country_novelty(
@@ -90,8 +97,8 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
     incoming = transfer & approved & credit
     outgoing = transfer & approved & debit
 
-    df["inflow_sum_24h"] = _rolling_masked_sum(df, incoming, WINDOW_24H)
-    df["outflow_sum_24h"] = _rolling_masked_sum(df, outgoing, WINDOW_24H)
+    df["inflow_sum_24h"] = _rolling_masked_sum(df, incoming, WINDOW_24H, keys=("IBAN", "Currency"))
+    df["outflow_sum_24h"] = _rolling_masked_sum(df, outgoing, WINDOW_24H, keys=("IBAN", "Currency"))
     # No inflow means that pass-through behaviour is not measurable yet.
     df["pass_through_ratio"] = pd.Series(
         np.divide(
@@ -143,9 +150,6 @@ def _validate_inputs(df: pd.DataFrame) -> None:
     if df["timestamp"].isna().any():
         raise ValueError("timestamp must not contain null values")
 
-    # Construct the Series explicitly. Besides preserving the dataframe index,
-    # this avoids pandas-stubs selecting pd.to_numeric's scalar ``float``
-    # overload in static type checkers such as Pylance.
     amount = pd.Series(
         pd.to_numeric(df["Transaction Amount"].to_numpy(), errors="coerce"),
         index=df.index,
@@ -156,18 +160,11 @@ def _validate_inputs(df: pd.DataFrame) -> None:
 
 
 def _log_amount(df: pd.DataFrame) -> pd.Series:
-    """Return ``log(1 + amount)`` so the feature is defined near zero."""
     amounts = df["Transaction Amount"].to_numpy(dtype=float)
     return pd.Series(np.log1p(amounts), index=df.index, dtype="float64")
 
 
 def _amount_ratio(df: pd.DataFrame, grouped) -> pd.Series:
-    """
-    Divide amount by the account's expanding prior average.
-
-    The current row is excluded so that a large transaction cannot raise its
-    own baseline. The first row for an account receives the neutral ratio 1.
-    """
     prior_sum = grouped["Transaction Amount"].cumsum() - df["Transaction Amount"]
     prior_count = grouped.cumcount()
     prior_average = prior_sum.div(prior_count.replace(0, np.nan))
@@ -176,23 +173,15 @@ def _amount_ratio(df: pd.DataFrame, grouped) -> pd.Series:
 
 
 def _tx_count_24h(df: pd.DataFrame, grouped) -> pd.Series:
-    """Count this account's transactions in ``(timestamp - 24h, timestamp]``."""
     return _rolling_count(df, WINDOW_24H)
 
 
 def _sum_48h_window(df: pd.DataFrame, grouped) -> pd.Series:
-    """Sum this account's transaction amounts over the trailing 48 hours."""
     all_rows = pd.Series(True, index=df.index)
-    return _rolling_masked_sum(df, all_rows, WINDOW_48H)
+    return _rolling_masked_sum(df, all_rows, WINDOW_48H, keys=("IBAN", "Currency"))
 
 
 def _country_novelty(df: pd.DataFrame, grouped):
-    """
-    Return first-seen country and channel-trust strength.
-
-    POS/ATM/branch activity is ``solid``, e-commerce is ``weak``, and
-    remote Mobile/Web transfers are ``weakest``.
-    """
     countries = _normalise_text(df["Transaction Country"])
     flag = _first_seen_by_account(df, countries)
 
@@ -215,13 +204,11 @@ def _country_novelty(df: pd.DataFrame, grouped):
 
 
 def _device_novelty(df: pd.DataFrame, grouped) -> pd.Series:
-    """Return first-seen device, or ``pd.NA`` when no device applies."""
     devices = _normalise_text(df["Device ID"])
     return _nullable_first_seen_by_account(df, devices, df["Device ID"].notna())
 
 
 def _merchant_novelty(df: pd.DataFrame, grouped) -> pd.Series:
-    """Return first-seen beneficiary, or ``pd.NA`` for cash/no beneficiary."""
     merchants = _normalise_text(df["Beneficiary Name"])
     return _nullable_first_seen_by_account(
         df, merchants, df["Beneficiary Name"].notna()
@@ -229,12 +216,6 @@ def _merchant_novelty(df: pd.DataFrame, grouped) -> pd.Series:
 
 
 def _hour_deviation(df: pd.DataFrame, grouped) -> pd.Series:
-    """
-    Circular distance in hours from the account's prior usual transaction hour.
-
-    Circular averaging handles midnight correctly (23:00 and 01:00 average to
-    00:00, not noon). An account's first transaction receives neutral zero.
-    """
     hour = (
         df["timestamp"].dt.hour
         + df["timestamp"].dt.minute / 60
@@ -267,14 +248,12 @@ def _hour_deviation(df: pd.DataFrame, grouped) -> pd.Series:
 
 
 def _declined_burst(df: pd.DataFrame, grouped) -> pd.Series:
-    """Count declines in the prior trailing 24 hours, excluding this row."""
     declined = df["Status"].astype("string").str.casefold().eq("declined")
     counts, _ = _prior_window_counts(df, declined, WINDOW_24H)
     return counts
 
 
 def _recent_decline_density(df: pd.DataFrame, grouped) -> pd.Series:
-    """Prior 24-hour declines divided by all prior transactions in that window."""
     declined = df["Status"].astype("string").str.casefold().eq("declined")
     decline_count, total_count = _prior_window_counts(df, declined, WINDOW_24H)
     return pd.Series(
@@ -290,7 +269,6 @@ def _recent_decline_density(df: pd.DataFrame, grouped) -> pd.Series:
 
 
 def _dormancy_days(df: pd.DataFrame, grouped) -> pd.Series:
-    """Days elapsed since the account's previous transaction."""
     previous = grouped["timestamp"].shift(1)
     elapsed = (df["timestamp"] - previous).dt.total_seconds().div(86_400)
     return elapsed.fillna(0.0).clip(lower=0.0).astype(float)
@@ -348,13 +326,16 @@ def _rolling_count(df: pd.DataFrame, window: pd.Timedelta) -> pd.Series:
 
 
 def _rolling_masked_sum(
-    df: pd.DataFrame, mask: pd.Series, window: pd.Timedelta
+    df: pd.DataFrame,
+    mask: pd.Series,
+    window: pd.Timedelta,
+    keys: tuple[str, ...] = ("IBAN",),
 ) -> pd.Series:
     result = np.zeros(len(df), dtype=float)
     amounts = df["Transaction Amount"].astype(float).to_numpy()
     selected = mask.fillna(False).to_numpy(dtype=bool)
 
-    for positions in _group_positions(df):
+    for positions in _group_positions(df, keys=keys):
         left = 0
         running = 0.0
         times = df["timestamp"].iloc[positions].tolist()
@@ -432,8 +413,9 @@ def _rolling_distinct_count(
     return pd.Series(result, index=df.index, dtype="int64")
 
 
-def _group_positions(df: pd.DataFrame) -> Iterator[NDArray[np.intp]]:
-    """Yield positional arrays without assuming that dataframe labels are unique."""
-    groups = df.groupby("IBAN", sort=False, dropna=False).indices
+def _group_positions(
+    df: pd.DataFrame, keys: tuple[str, ...] = ("IBAN",)
+) -> Iterator[NDArray[np.intp]]:
+    groups = df.groupby(list(keys), sort=False, dropna=False).indices
     for positions in groups.values():
         yield np.asarray(positions, dtype=np.intp)

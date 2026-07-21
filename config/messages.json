@@ -1,0 +1,21 @@
+{
+  "decline_probing": "Multiple declined transactions followed by an approval.",
+
+  "new_p2p_transfer": "Large transfer to a previously unseen beneficiary.",
+
+  "mule_pass_through": "Possible pass-through account behavior detected.",
+
+  "dormant_reactivation": "Large debit after a long period of inactivity.",
+
+  "country_mismatch_solid": "First transaction from a new country through a high-confidence channel.",
+
+  "new_account_large_amount": "Large transaction from a newly opened account.",
+
+  "device_added_same_day": "Device was added shortly before it was used.",
+
+  "structuring": "Multiple transactions collectively exceed the structuring threshold.",
+
+  "velocity_burst": "High number of transactions within 24 hours.",
+
+  "currency_threshold_missing": "No thresholds are configured for this currency. Threshold-based rules were skipped, but statistical anomaly detection was still performed."
+}

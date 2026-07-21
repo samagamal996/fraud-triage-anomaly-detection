@@ -1,0 +1,34 @@
+{
+  "currencies": [
+  "EGP",
+  "USD",
+  "EUR"
+  ],
+
+  "statuses": [
+    "Approved",
+    "Declined"
+  ],
+
+  "debit_credit": [
+    "Debit",
+    "Credit"
+  ],
+
+  "account_types": [
+    "retail",
+    "corporate"
+  ],
+
+  "transaction_types": [
+    "Transfer",
+    "POS",
+    "POS (Apple Pay)",
+    "POS (Google Pay)",
+    "E-Commerce",
+    "E-Commerce (Apple Pay)",
+    "E-Commerce (Google Pay)",
+    "Cash Withdrawal",
+    "Cash Deposit"
+  ]
+}

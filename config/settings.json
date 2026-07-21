@@ -1,0 +1,21 @@
+{
+  "history": {
+    "minimum_transactions": 5,
+    "rolling_amount_days": 30
+  },
+
+  "windows": {
+    "tx_count_hours": 24,
+    "structuring_hours": 48
+  },
+
+  "isolation_forest": {
+    "contamination": 0.005,
+    "n_estimators": 200,
+    "random_state": 42
+  },
+
+  "lof": {
+    "neighbors": 20
+  }
+}
