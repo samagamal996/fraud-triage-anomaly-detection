@@ -138,6 +138,13 @@ def build(df: pd.DataFrame) -> pd.DataFrame:
     df["device_age_days"] = _age_in_days(
         df["timestamp"], df["Device Add Date"], nullable=True
     )
+    df["hours_since_last_tx"] = (
+    grouped["timestamp"]
+    .diff()
+    .dt.total_seconds()
+    .div(3600)
+    .fillna(np.inf)
+    )
 
     return df
 
