@@ -6,6 +6,15 @@ Branch: task3-detectors
 Three independent detection layers, combined into one ranked, comparable
 score, plus a per-row rule_flags list. See SCHEMA.md for the exact
 output contract.
+
+Currency handling: all threshold-based rules convert Transaction Amount
+to an EGP-equivalent using a fixed exchange rate (config/thresholds.json
+-> fx_to_egp), then compare against a single set of EGP thresholds.
+Only EGP and USD are supported (see config/schema.json) — an unsupported
+currency is rejected upstream by data_layer.py's enum check, so it
+should never reach this module, but the fallback below stays as a
+defensive guard in case detectors.py is ever called directly on
+unvalidated data (e.g. in a test script).
 """
 
 import numpy as np
@@ -14,8 +23,14 @@ from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 
+from config_loader import load_config
 
-MIN_HISTORY = 5  # minimum txns in (IBAN, Currency) group before stats are trusted
+SETTINGS = load_config("settings.json")
+THRESHOLDS_CFG = load_config("thresholds.json")
+EGP_THRESHOLDS = THRESHOLDS_CFG["egp_thresholds"]
+FX_TO_EGP = THRESHOLDS_CFG["fx_to_egp"]
+
+MIN_HISTORY = SETTINGS["history"]["minimum_transactions"]  # min txns in (IBAN, Currency) group before stats are trusted
 
 def compute_stat_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -89,18 +104,24 @@ def rank_normalize(raw_scores: np.ndarray) -> np.ndarray:
     return ranks / (len(ranks) - 1)
 
 
-def fit_isolation_forest(X: pd.DataFrame, contamination=0.005, random_state=42) -> np.ndarray:
+def fit_isolation_forest(X: pd.DataFrame, contamination=None, random_state=None) -> np.ndarray:
     # Real fraud rates run ~0.1-0.5%, NOT sklearn's ~10% default.
+    contamination = SETTINGS["isolation_forest"]["contamination"] if contamination is None else contamination
+    random_state = SETTINGS["isolation_forest"]["random_state"] if random_state is None else random_state
+    n_estimators = SETTINGS["isolation_forest"]["n_estimators"]
+
     assert not X.isna().any().any(), "NaNs in model matrix — fix in build_model_matrix, not here"
     if len(X) < 2:
         return np.zeros(len(X))
-    iso = IsolationForest(n_estimators=200, contamination=contamination, random_state=random_state)
+    iso = IsolationForest(n_estimators=n_estimators, contamination=contamination, random_state=random_state)
     iso.fit(X)
     raw = -iso.decision_function(X)  # sign flip: high = weird
     return rank_normalize(raw)
 
 
-def fit_lof(X: pd.DataFrame, n_neighbors=20) -> np.ndarray:
+def fit_lof(X: pd.DataFrame, n_neighbors=None) -> np.ndarray:
+    n_neighbors = SETTINGS["lof"]["neighbors"] if n_neighbors is None else n_neighbors
+
     assert not X.isna().any().any(), "NaNs in model matrix — fix in build_model_matrix, not here"
     if len(X) < 2:
         # can't compute a *local* density with fewer than 2 points to compare against
@@ -127,155 +148,416 @@ def score_models(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# Rules (9 total, each mapped to a specific corner case)
-#
-# Per-currency thresholds, NOT a conversion rate. We don't have a real
-# exchange rate in the data, and hardcoding one would go stale silently.
-# Each rule gets its own number per currency instead. `None` means
-# "no threshold set for this currency yet" — rows in that currency
-# CANNOT trigger the rule, and get flagged via `currency_unhandled`
-# below so that's visible, not confused with "checked and clean."
-AMOUNT_THRESHOLDS = {
-    "p2p_transfer":          {"EGP": 10_000, "USD": 200},
-    "dormant_reactivation":  {"EGP": 10_000, "USD": 200},
-    "new_account":           {"EGP":  5_000, "USD": 100},
-    "structuring":           {"EGP": 25_000, "USD": 500},
-}
+# Currency conversion
+def _amount_in_egp(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    rate = df["Currency"].map(FX_TO_EGP).astype(float)
+    unresolved = rate.isna()
+    amount_egp = df["Transaction Amount"] * rate
+    return amount_egp, unresolved
 
 
-def _threshold_and_gap(df: pd.DataFrame, rule_name: str) -> tuple[pd.Series, pd.Series]:
-    """
-    Returns (threshold per row, unresolved mask). `unresolved` is True
-    where this row's currency has no threshold defined for this rule —
-    those rows are excluded from the rule (can't evaluate) rather than
-    silently passing it.
-    """
-    table = AMOUNT_THRESHOLDS[rule_name]
-    threshold = df["Currency"].map(table).astype(float)  # NaN where currency missing or value is None
-    unresolved = threshold.isna()
-    return threshold, unresolved
+# Structuring helper
+def _structuring_burst_count(
+    df: pd.DataFrame,
+    amount_egp: pd.Series,
+    window: str = "24h",
+    band=(0.80, 1.00),
+):
+
+    unit = EGP_THRESHOLDS["p2p_transfer"]
+
+    near = (
+        df["Transaction Type"].eq("Transfer")
+        & amount_egp.between(unit * band[0], unit * band[1])
+    )
+
+    result = np.zeros(len(df), dtype=int)
+
+    for _, g in (
+        df.assign(_near=near, _amt=amount_egp)
+        .sort_values("timestamp")
+        .groupby("IBAN", sort=False)
+    ):
+
+        idx = g.index.to_numpy()
+        ts = g["timestamp"].to_numpy()
+        flags = g["_near"].to_numpy()
+
+        left = 0
+
+        for i in range(len(g)):
+
+            while left < i and ts[left] < ts[i] - pd.Timedelta(window):
+                left += 1
+
+            result[idx[i]] = flags[left:i+1].sum()
+
+    return (
+        pd.Series(result, index=df.index),
+        pd.Series(near, index=df.index),
+    )
+
+
+# Impossible travel
+def _impossible_travel(
+    df: pd.DataFrame,
+    hours: int = 6,
+):
+
+    prev_country = (
+        df.groupby("IBAN")["Transaction Country"]
+        .shift()
+    )
+
+    delta = df["hours_since_last_tx"]
+
+    return (
+        prev_country.notna()
+        & (prev_country != df["Transaction Country"])
+        & (delta < hours)
+    )
+
+
+# Extreme amount
+def _extreme_amount(df):
+
+    mad = df["mad_flag"].fillna(False)
+    iqr = df["iqr_flag"].fillna(False)
+
+    return (
+        mad
+        | iqr
+        | (df["amount_ratio"] >= 8)
+    )
+
+
+# Foreign currency spike
+def _foreign_currency_spike(
+    df,
+    amount_egp,
+):
+
+    prev_currency = (
+        df.groupby("IBAN")["Currency"]
+        .shift()
+    )
+
+    return (
+        prev_currency.notna()
+        & (prev_currency != df["Currency"])
+        & (amount_egp > 30000)
+    )
+
+# Layering
+def _layering(df):
+    prev_amount = (
+        df.groupby("IBAN")["Transaction Amount"]
+        .shift()
+    )
+
+    prev_dc = (
+        df.groupby("IBAN")["Debit/Credit"]
+        .shift()
+    )
+
+    prev_time = (
+        df.groupby("IBAN")["timestamp"]
+        .shift()
+    )
+
+    delta = (
+        df["timestamp"] - prev_time
+    ).dt.total_seconds() / 60
+
+    return (
+        (prev_dc == "Credit")
+        &
+        (df["Debit/Credit"] == "Debit")
+        &
+        (delta <= 60)
+        &
+        (
+            abs(
+                df["Transaction Amount"] -
+                prev_amount
+            )
+            <= prev_amount * 0.20
+        )
+    )
 
 
 def compute_rule_flags(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds one boolean column per rule (rule_<name>), a comma-joined
-    `rule_flags` summary column, and a separate `data_quality_flags`
-    column for issues that are about the DATA being wrong, not a
-    transaction being suspicious (kept separate so they don't inflate
-    the fraud/mule alert queue).
-    """
     df = df.copy()
+    amount_egp, unresolved_currency_mask = _amount_in_egp(df)
 
-    unresolved_currency_mask = pd.Series(False, index=df.index)
+    # Existing Rules (improved)
+    rule_decline_probing = (
+        df["decline_then_approve_flag"]
+        .fillna(False)
+        .astype(bool)
+    )
 
-    # --- Rule 1: decline-then-approve probing
-    rule_decline_probing = df["decline_then_approve_flag"].fillna(False).astype(bool)
-
-    # --- Rule 2: transfer to a person ---
-    threshold, unresolved = _threshold_and_gap(df, "p2p_transfer")
-    unresolved_currency_mask |= unresolved
     rule_new_p2p_transfer = (
         (df["Transaction Type"] == "Transfer")
-        & (df["Beneficiary Type"].isin(["Bank", "Digital Wallet"]))
-        & (df["new_merchant_flag"].fillna(False).astype(bool))
-        & (~unresolved)
-        & (df["Transaction Amount"] > threshold)
+        &
+        (df["Beneficiary Type"].isin(
+            ["Bank", "Digital Wallet"]
+        ))
+        &
+        df["new_merchant_flag"].fillna(False)
+        &
+        (amount_egp > EGP_THRESHOLDS["p2p_transfer"])
+        &
+        (df["combined_score"] > 0.75)
     )
 
-    # --- Rule 3: mule — pass-through --- (currency-independent: ratio + count, no amount)
-    rule_mule_pass_through = df["pass_through_ratio"].between(0.85, 1.15) & (
-        (df["distinct_senders_24h"] >= 3) | (df["distinct_recipients_24h"] >= 3)
+    rule_mule_pass_through = (
+        df["pass_through_ratio"].between(0.90, 1.10)
+        &
+        (
+            (df["distinct_senders_24h"] >= 4)
+            |
+            (df["distinct_recipients_24h"] >= 4)
+        )
     )
 
-    # --- Rule 4: fraud — dormant reactivation ---
-    threshold, unresolved = _threshold_and_gap(df, "dormant_reactivation")
-    unresolved_currency_mask |= unresolved
     rule_dormant_reactivation = (
-        (df["dormancy_days"] >= 30)
-        & (df["Debit/Credit"] == "Debit")
-        & (~unresolved)
-        & (df["Transaction Amount"] > threshold)
+        (df["dormancy_days"] >= 45)
+        &
+        (df["Debit/Credit"] == "Debit")
+        &
+        (amount_egp > EGP_THRESHOLDS["dormant_reactivation"])
     )
 
-    # --- Rule 5: country mismatch, solid channel ---
-    # Uses new_country_flag (first time THIS account used this country —
-    # a behavioral change) rather than country_mismatch (vs birth
-    # Nationality — permanent for any expat/foreign-national customer,
-    # confirmed via testing: one real account flagged on ALL 9 of its
-    # solid-channel transactions purely for having a non-Egyptian
-    # nationality, which isn't a fraud signal at all).
-    rule_country_mismatch = df["new_country_flag"].fillna(False).astype(bool) & (
-        df["country_signal_strength"] == "solid"
+    rule_country_mismatch = (
+        df["new_country_flag"].fillna(False)
+        &
+        (df["country_signal_strength"] == "solid")
+        &
+        (df["Transaction Country"] != df["Nationality"])
     )
 
-    # --- Rule 6: new account + large transaction ---
-    threshold, unresolved = _threshold_and_gap(df, "new_account")
-    unresolved_currency_mask |= unresolved
-    rule_new_account_large_amount = df["is_new_account"].fillna(False).astype(bool) & (
-        ~unresolved
-    ) & (df["Transaction Amount"] > threshold)
+    rule_new_account_large_amount = (
+        df["is_new_account"]
+        &
+        (amount_egp > EGP_THRESHOLDS["new_account"])
+    )
 
-    # --- Rule 7: device added shortly before use ---
     device_age = df["device_age_days"]
-    rule_device_added_same_day = device_age.notna() & (device_age >= 0) & (device_age < 1)
-    data_issue_negative_device_age = device_age.notna() & (device_age < 0)
 
-    # --- Rule 8: structuring ---
-    # NOTE: sum_48h_window is computed upstream in Task 2 by summing raw
-    # Transaction Amount with no currency split — on an account that
-    # mixes EGP and USD, this sum silently mixes units. Flag to Task 2;
-    # not fixable from here since we only receive the already-summed column.
-    threshold, unresolved = _threshold_and_gap(df, "structuring")
-    unresolved_currency_mask |= unresolved
-    rule_structuring = (
-        (~unresolved) & (df["sum_48h_window"] > threshold) & (df["tx_count_24h"] >= 3)
+    rule_device_added_same_day = (
+        device_age.notna()
+        &
+        (device_age >= 0)
+        &
+        (device_age < 1)
+        &
+        (amount_egp > 15000)
     )
 
-    # --- Rule 9: velocity burst ---
-    rule_velocity_burst = df["tx_count_24h"] >= 5
+    data_issue_negative_device_age = (
+        device_age.notna()
+        &
+        (device_age < 0)
+    )
 
+    # Improved Structuring
+    burst_count, near_threshold = _structuring_burst_count(
+        df,
+        amount_egp,
+    )
+
+    rule_structuring = (
+        near_threshold
+        &
+        (burst_count >= 3)
+        &
+        (df["combined_score"] > 0.70)
+    )
+
+    # Improved Velocity Burst
+    median_tx = (
+        df.groupby("IBAN")["tx_count_24h"]
+        .transform("median")
+    )
+
+    rule_velocity_burst = (
+        (df["tx_count_24h"] >= 8)
+        &
+        (df["tx_count_24h"] >= median_tx * 2.5)
+    )
+
+    # NEW RULES
+    rule_impossible_travel = _impossible_travel(df)
+
+    rule_extreme_amount = (
+        _extreme_amount(df)
+        &
+        (df["combined_score"] > 0.80)
+    )
+
+    rule_foreign_currency_spike = (
+        _foreign_currency_spike(
+            df,
+            amount_egp,
+        )
+        &
+        (df["combined_score"] > 0.70)
+    )
+
+    rule_layering = (
+        _layering(df)
+        &
+        (df["combined_score"] > 0.75)
+    )
+
+    # Register Rules
     rule_defs = {
+
         "decline_probing": rule_decline_probing,
+
         "new_p2p_transfer": rule_new_p2p_transfer,
+
         "mule_pass_through": rule_mule_pass_through,
+
         "dormant_reactivation": rule_dormant_reactivation,
+
         "country_mismatch_solid": rule_country_mismatch,
+
         "new_account_large_amount": rule_new_account_large_amount,
+
         "device_added_same_day": rule_device_added_same_day,
+
         "structuring": rule_structuring,
+
         "velocity_burst": rule_velocity_burst,
+
+        "impossible_travel": rule_impossible_travel,
+
+        "extreme_amount": rule_extreme_amount,
+
+        "foreign_currency_spike": rule_foreign_currency_spike,
+
+        "layering": rule_layering,
     }
 
     for name, mask in rule_defs.items():
         df[f"rule_{name}"] = mask.fillna(False)
 
-    # list[str] per SCHEMA.md — not a comma-joined string, since Task 4
-    # needs to iterate individual rule names per row.
-    rule_cols = [f"rule_{n}" for n in rule_defs]
+    rule_cols = [
+        f"rule_{n}"
+        for n in rule_defs
+    ]
+
     df["rule_flags"] = df[rule_cols].apply(
-        lambda r: [n for n, v in zip(rule_defs.keys(), r) if v], axis=1
+        lambda row: [
+            name
+            for name, value
+            in zip(rule_defs.keys(), row)
+            if value
+        ],
+        axis=1,
     )
 
-    quality_issues = pd.Series([[] for _ in range(len(df))], index=df.index)
-    quality_issues = quality_issues.mask(
-        data_issue_negative_device_age.fillna(False),
-        quality_issues.apply(lambda lst: lst + ["device_added_after_transaction"]),
+    quality = pd.Series(
+        [[] for _ in range(len(df))],
+        index=df.index,
     )
-    quality_issues = quality_issues.mask(
-        unresolved_currency_mask.fillna(False),
-        quality_issues.apply(lambda lst: lst + ["currency_unhandled_for_amount_rule"]),
-    )
-    df["data_quality_flags"] = quality_issues
-    # A fired rule is deterministic certainty (per the deck: "rules win on
-    # known, explainable patterns") — it should never be outranked by a
-    # model's opinion. Any row with >=1 rule fired gets pushed to at
-    # least 0.95, but keeps its model score if that's already higher.
-    has_rule = df["rule_flags"].apply(len) > 0
-    if "combined_score" in df.columns:
-        df["combined_score"] = np.where(has_rule, np.maximum(df["combined_score"], 0.95), df["combined_score"])
 
+    quality = quality.mask(
+        data_issue_negative_device_age,
+        quality.apply(
+            lambda x: x + ["device_added_after_transaction"]
+        ),
+    )
+
+    quality = quality.mask(
+        unresolved_currency_mask,
+        quality.apply(
+            lambda x: x + ["currency_threshold_missing"]
+        ),
+
+    )
+
+    df["data_quality_flags"] = quality
+
+    # Better Final Score
+    has_rule = (
+        df["rule_flags"]
+        .apply(len)
+        > 0
+    )
+
+    agreement = (
+        has_rule
+        &
+        (df["combined_score"] >= 0.80)
+
+    )
+
+    df["combined_score"] = np.where(
+        agreement,
+        1.0,
+        np.where(
+            has_rule,
+            np.maximum(
+                df["combined_score"],
+                0.95,
+            ),
+            df["combined_score"],
+        ),
+    )
+    df["case_type"] = df["rule_flags"].apply(classify_case)
+
+    def confidence(score):
+        if score >= 0.95:
+            return "High"
+
+        if score >= 0.80:
+            return "Medium"
+        return "Low"
+    df["confidence"] = df["combined_score"].apply(confidence)
     return df
 
+FRAUD_RULES = {
+    "decline_probing",
+    "new_p2p_transfer",
+    "dormant_reactivation",
+    "country_mismatch_solid",
+    "new_account_large_amount",
+    "device_added_same_day",
+    "structuring",
+    "velocity_burst",
+    "impossible_travel",
+    "extreme_amount",
+    "foreign_currency_spike",
+}
+
+MULE_RULES = {
+    "mule_pass_through",
+    "layering",
+}
+
+
+def classify_case(rule_flags):
+    flags = set(rule_flags)
+
+    fraud = len(flags & FRAUD_RULES)
+    mule = len(flags & MULE_RULES)
+
+    if fraud and mule:
+        return "Mixed"
+
+    if fraud:
+        return "Fraud"
+
+    if mule:
+        return "Mule"
+
+    if len(flags) > 0:
+        return "Suspicious"
+
+    return "Normal"
 
 def score(df: pd.DataFrame) -> pd.DataFrame:
     """Run all three layers. Input must be Task 2's feature-engineered output."""
@@ -289,25 +571,14 @@ if __name__ == "__main__":
     import data_layer
     import features
 
-    raw = data_layer.validate("/mnt/user-data/uploads/Sample_Data.xlsx")
+    raw = data_layer.validate("data/Sample_Data.xlsx")
     featured = features.build(raw)
     result = score(featured)
 
     print("Shape:", result.shape)
     print()
     print("Stat basis distribution:", result["stat_basis"].value_counts().to_dict())
-    print("mad_flag counts:", result["mad_flag"].value_counts(dropna=False).to_dict())
-    print("iqr_flag counts:", result["iqr_flag"].value_counts(dropna=False).to_dict())
     print()
-    print("rule_flags: rows with >=1 rule fired:", (result["rule_flags"].str.len() > 0).sum(), "/", len(result))
-    fired = result[result["rule_flags"].str.len() > 0]
-    if not fired.empty:
-        print(fired[["Transaction ID", "rule_flags"]].to_string())
-    print()
-    dq_nonempty = result[result["data_quality_flags"].str.len() > 0]
-    print("data_quality_flags: rows with >=1 issue:", len(dq_nonempty), "/", len(result))
-    if not dq_nonempty.empty:
-        print(dq_nonempty[["Transaction ID", "Currency", "data_quality_flags"]].to_string())
+    print("rule_flags: rows with >=1 rule fired:", (result["rule_flags"].apply(len) > 0).sum(), "/", len(result))
     print()
     print("Score columns present:", [c for c in ["iso_score", "lof_score", "combined_score"] if c in result.columns])
-    print(result[["Transaction ID", "iso_score", "lof_score", "combined_score"]].sort_values("combined_score", ascending=False).head(10).to_string())

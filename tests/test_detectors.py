@@ -7,6 +7,24 @@ df = validate(r"data\Sample_Data.xlsx")
 df = build(df)
 df = score(df)
 
+rules = [
+    "decline_probing",
+    "new_p2p_transfer",
+    "mule_pass_through",
+    "dormant_reactivation",
+    "country_mismatch_solid",
+    "new_account_large_amount",
+    "device_added_same_day",
+    "structuring",
+    "velocity_burst",
+]
+
+print("\nRule counts")
+print("-" * 40)
+
+for rule in rules:
+    print(f"{rule:30} {df[f'rule_{rule}'].sum()}")
+
 print(df.shape)
 print()
 print(df[[

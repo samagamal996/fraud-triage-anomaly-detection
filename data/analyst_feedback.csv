@@ -1,0 +1,3 @@
+session_id,file_name,transaction_id,verdict,recorded_at
+Sample Data.xlsx-e85911e7cdf1,Sample Data.xlsx,TX0000061,unsure,2026-07-21T02:19:29+00:00
+Synthetic_Fraud_Test_Data (1).xlsx-d960f69e71dd,Synthetic_Fraud_Test_Data (1).xlsx,SYN2026-000292,fraud,2026-07-21T03:08:23+00:00
